@@ -295,20 +295,24 @@ impl Config {
     ///
     /// The `raw_window_handle` should point to a valid value.
     pub unsafe fn apply_on_native_window(&self, raw_window_handle: &RawWindowHandle) -> Result<()> {
-        let hdc = match raw_window_handle {
-            RawWindowHandle::Win32(window) => unsafe { gdi::GetDC(window.hwnd.get() as _) },
+        let hwnd = match raw_window_handle {
+            RawWindowHandle::Win32(window) => window.hwnd.get() as _,
             _ => return Err(ErrorKind::BadNativeWindow.into()),
         };
+        let hdc = unsafe { gdi::GetDC(hwnd) };
 
         let descriptor =
             self.inner.descriptor.as_ref().map(|desc| desc as _).unwrap_or(std::ptr::null());
 
         unsafe {
-            if gl::SetPixelFormat(hdc, self.inner.pixel_format_index, descriptor) == 0 {
+            let result = if gl::SetPixelFormat(hdc, self.inner.pixel_format_index, descriptor) == 0
+            {
                 Err(IoError::last_os_error().into())
             } else {
                 Ok(())
-            }
+            };
+            gdi::ReleaseDC(hwnd, hdc);
+            result
         }
     }
 
