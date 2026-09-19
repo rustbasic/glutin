@@ -32,22 +32,26 @@ impl Display {
         config: &Config,
         context_attributes: &ContextAttributes,
     ) -> Result<NotCurrentContext> {
-        let hdc = match context_attributes.raw_window_handle.as_ref() {
-            handle @ Some(RawWindowHandle::Win32(window)) => unsafe {
-                let _ = config.apply_on_native_window(handle.unwrap());
-                gdi::GetDC(window.hwnd.get() as _)
+        let window_hdc = match context_attributes.raw_window_handle.as_ref() {
+            handle @ Some(RawWindowHandle::Win32(window)) => {
+                let hwnd = window.hwnd.get() as _;
+                unsafe {
+                    let _ = config.apply_on_native_window(handle.unwrap());
+                    Some((hwnd, gdi::GetDC(hwnd)))
+                }
             },
-            _ => config.inner.hdc,
+            _ => None,
         };
+        let hdc = window_hdc.map(|(_, hdc)| hdc).unwrap_or(config.inner.hdc);
 
         let share_ctx = match context_attributes.shared_context {
             Some(RawContext::Wgl(share)) => share,
             _ => std::ptr::null(),
         };
 
-        let (context, supports_surfaceless) =
+        let context_result = (|| {
             if self.inner.client_extensions.contains("WGL_ARB_create_context") {
-                self.create_context_arb(hdc, share_ctx, context_attributes)?
+                self.create_context_arb(hdc, share_ctx, context_attributes)
             } else {
                 unsafe {
                     let raw = wgl::CreateContext(hdc as *const _);
@@ -60,9 +64,15 @@ impl Display {
                         return Err(IoError::last_os_error().into());
                     }
 
-                    (WglContext(raw), false)
+                    Ok((WglContext(raw), false))
                 }
-            };
+            }
+        })();
+
+        if let Some((hwnd, hdc)) = window_hdc {
+            unsafe { gdi::ReleaseDC(hwnd, hdc) };
+        }
+        let (context, supports_surfaceless) = context_result?;
 
         let config = config.clone();
         let is_gles = matches!(context_attributes.api, Some(ContextApi::Gles(_)));
