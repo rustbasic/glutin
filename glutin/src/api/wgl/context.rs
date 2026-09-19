@@ -10,6 +10,7 @@ use glutin_wgl_sys::wgl::types::HGLRC;
 use glutin_wgl_sys::{wgl, wgl_extra};
 use raw_window_handle::RawWindowHandle;
 use windows_sys::Win32::Graphics::Gdi::{self as gdi, HDC};
+use windows_sys::Win32::Graphics::OpenGL as gl;
 
 use crate::config::GetGlConfig;
 use crate::context::{
@@ -32,22 +33,32 @@ impl Display {
         config: &Config,
         context_attributes: &ContextAttributes,
     ) -> Result<NotCurrentContext> {
-        let hdc = match context_attributes.raw_window_handle.as_ref() {
-            handle @ Some(RawWindowHandle::Win32(window)) => unsafe {
-                let _ = config.apply_on_native_window(handle.unwrap());
-                gdi::GetDC(window.hwnd.get() as _)
+        let window_hdc = match context_attributes.raw_window_handle.as_ref() {
+            handle @ Some(RawWindowHandle::Win32(window)) => {
+                let hwnd = window.hwnd.get() as _;
+                unsafe {
+                    let _ = config.apply_on_native_window(handle.unwrap());
+                    Some((hwnd, gdi::GetDC(hwnd)))
+                }
             },
-            _ => config.inner.hdc,
+            _ => None,
         };
+        let hdc = window_hdc.map(|(_, hdc)| hdc).unwrap_or(config.inner.hdc);
 
         let share_ctx = match context_attributes.shared_context {
             Some(RawContext::Wgl(share)) => share,
             _ => std::ptr::null(),
         };
 
-        let (context, supports_surfaceless) =
+        let context_result = (|| {
             if self.inner.client_extensions.contains("WGL_ARB_create_context") {
-                self.create_context_arb(hdc, share_ctx, context_attributes)?
+                self.create_context_arb(
+                    config,
+                    hdc,
+                    share_ctx,
+                    context_attributes,
+                    window_hdc.is_some(),
+                )
             } else {
                 unsafe {
                     let raw = wgl::CreateContext(hdc as *const _);
@@ -60,9 +71,15 @@ impl Display {
                         return Err(IoError::last_os_error().into());
                     }
 
-                    (WglContext(raw), false)
+                    Ok((WglContext(raw), false))
                 }
-            };
+            }
+        })();
+
+        if let Some((hwnd, hdc)) = window_hdc {
+            unsafe { gdi::ReleaseDC(hwnd, hdc) };
+        }
+        let (context, supports_surfaceless) = context_result?;
 
         let config = config.clone();
         let is_gles = matches!(context_attributes.api, Some(ContextApi::Gles(_)));
@@ -78,9 +95,11 @@ impl Display {
 
     fn create_context_arb(
         &self,
+        config: &Config,
         hdc: HDC,
         share_context: HGLRC,
         context_attributes: &ContextAttributes,
+        window_bound_hdc: bool,
     ) -> Result<(WglContext, bool)> {
         let extra = self.inner.wgl_extra.as_ref().unwrap();
         let mut attrs = Vec::<c_int>::with_capacity(16);
@@ -211,7 +230,25 @@ impl Display {
         unsafe {
             let raw = extra.CreateContextAttribsARB(hdc as _, share_context, attrs.as_ptr());
             if raw.is_null() {
-                Err(IoError::last_os_error().into())
+                // Preserve this before diagnostic WGL/Win32 queries can overwrite it.
+                let error = IoError::last_os_error();
+                let error_code = error.raw_os_error();
+                let current_context = wgl::GetCurrentContext();
+                let current_hdc = wgl::GetCurrentDC();
+                let actual_pixel_format = gl::GetPixelFormat(hdc);
+                log::info!(
+                    "wglCreateContextAttribsARB failed: os_error={error:?} os_error_code={error_code:?} os_error_hex={:#010X} hdc={:#X} window_bound_hdc={} requested_pixel_format={} actual_pixel_format={} share_context={:#X} has_share_context={} current_context={:#X} current_hdc={:#X} attributes={attrs:?}",
+                    error_code.unwrap_or_default() as u32,
+                    hdc as usize,
+                    window_bound_hdc,
+                    config.inner.pixel_format_index,
+                    actual_pixel_format,
+                    share_context as usize,
+                    !share_context.is_null(),
+                    current_context as usize,
+                    current_hdc as usize,
+                );
+                Err(error.into())
             } else {
                 Ok((WglContext(raw), supports_surfaceless))
             }
