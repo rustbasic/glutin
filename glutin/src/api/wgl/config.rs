@@ -42,7 +42,7 @@ impl Display {
             // Check that particular function was loaded.
             Some(wgl_extra) if wgl_extra.ChoosePixelFormatARB.is_loaded() => {
                 self.find_configs_arb(template, hdc)
-            }
+            },
             _ => self.find_normal_configs(template, hdc),
         }
     }
@@ -53,16 +53,13 @@ impl Display {
         hdc: HDC,
     ) -> Result<Box<dyn Iterator<Item = Config> + '_>> {
         let (r_size, g_size, b_size) = match template.color_buffer_type {
-            ColorBufferType::Rgb {
-                r_size,
-                g_size,
-                b_size,
-            } => (r_size, g_size, b_size),
+            ColorBufferType::Rgb { r_size, g_size, b_size } => (r_size, g_size, b_size),
             _ => {
-                return Err(
-                    ErrorKind::NotSupported("luminance buffers are not supported with WGL").into(),
+                return Err(ErrorKind::NotSupported(
+                    "luminance buffers are not supported with WGL",
                 )
-            }
+                .into());
+            },
         };
 
         let mut dw_flags = gl::PFD_SUPPORT_OPENGL;
@@ -70,17 +67,11 @@ impl Display {
             dw_flags |= gl::PFD_DOUBLEBUFFER;
         }
 
-        if template
-            .config_surface_types
-            .contains(ConfigSurfaceTypes::WINDOW)
-        {
+        if template.config_surface_types.contains(ConfigSurfaceTypes::WINDOW) {
             dw_flags |= gl::PFD_DRAW_TO_WINDOW;
         }
 
-        if template
-            .config_surface_types
-            .contains(ConfigSurfaceTypes::PIXMAP)
-        {
+        if template.config_surface_types.contains(ConfigSurfaceTypes::PIXMAP) {
             dw_flags |= gl::PFD_DRAW_TO_BITMAP;
         }
 
@@ -171,23 +162,20 @@ impl Display {
         let mut attrs = Vec::<c_int>::with_capacity(32);
 
         match template.color_buffer_type {
-            ColorBufferType::Rgb {
-                r_size,
-                g_size,
-                b_size,
-            } => {
+            ColorBufferType::Rgb { r_size, g_size, b_size } => {
                 attrs.push(wgl_extra::RED_BITS_ARB as c_int);
                 attrs.push(r_size as c_int);
                 attrs.push(wgl_extra::GREEN_BITS_ARB as c_int);
                 attrs.push(g_size as c_int);
                 attrs.push(wgl_extra::BLUE_BITS_ARB as c_int);
                 attrs.push(b_size as c_int);
-            }
+            },
             _ => {
-                return Err(
-                    ErrorKind::NotSupported("luminance buffers are not supported with WGL").into(),
+                return Err(ErrorKind::NotSupported(
+                    "luminance buffers are not supported with WGL",
                 )
-            }
+                .into());
+            },
         }
 
         attrs.push(wgl_extra::ALPHA_BITS_ARB as c_int);
@@ -205,10 +193,7 @@ impl Display {
         attrs.push(wgl_extra::DOUBLE_BUFFER_ARB as c_int);
         attrs.push(!template.single_buffering as c_int);
 
-        let pixel_type = if self
-            .inner
-            .features
-            .contains(DisplayFeatures::FLOAT_PIXEL_FORMAT)
+        let pixel_type = if self.inner.features.contains(DisplayFeatures::FLOAT_PIXEL_FORMAT)
             && template.float_pixels
         {
             wgl_extra::TYPE_RGBA_FLOAT_ARB
@@ -219,11 +204,7 @@ impl Display {
         };
 
         if let Some(num_samples) = template.num_samples {
-            if self
-                .inner
-                .features
-                .contains(DisplayFeatures::MULTISAMPLING_PIXEL_FORMATS)
-            {
+            if self.inner.features.contains(DisplayFeatures::MULTISAMPLING_PIXEL_FORMATS) {
                 attrs.push(wgl_extra::SAMPLE_BUFFERS_ARB as c_int);
                 attrs.push(1);
                 attrs.push(wgl_extra::SAMPLES_ARB as c_int);
@@ -248,26 +229,17 @@ impl Display {
             }
         }
 
-        if template
-            .config_surface_types
-            .contains(ConfigSurfaceTypes::WINDOW)
-        {
+        if template.config_surface_types.contains(ConfigSurfaceTypes::WINDOW) {
             attrs.push(wgl_extra::DRAW_TO_WINDOW_ARB as c_int);
             attrs.push(1);
         }
 
-        if template
-            .config_surface_types
-            .contains(ConfigSurfaceTypes::PIXMAP)
-        {
+        if template.config_surface_types.contains(ConfigSurfaceTypes::PIXMAP) {
             attrs.push(wgl_extra::DRAW_TO_WINDOW_ARB as c_int);
             attrs.push(1);
         }
 
-        if template
-            .config_surface_types
-            .contains(ConfigSurfaceTypes::PBUFFER)
-        {
+        if template.config_surface_types.contains(ConfigSurfaceTypes::PBUFFER) {
             attrs.push(wgl_extra::DRAW_TO_PBUFFER_ARB as c_int);
             attrs.push(1);
         }
@@ -297,17 +269,15 @@ impl Display {
             }
             configs.set_len(num_configs as _);
 
-            Ok(Box::new(configs.into_iter().map(
-                move |pixel_format_index| {
-                    let inner = Arc::new(ConfigInner {
-                        display: self.clone(),
-                        hdc,
-                        pixel_format_index,
-                        descriptor: None,
-                    });
-                    Config { inner }
-                },
-            )))
+            Ok(Box::new(configs.into_iter().map(move |pixel_format_index| {
+                let inner = Arc::new(ConfigInner {
+                    display: self.clone(),
+                    hdc,
+                    pixel_format_index,
+                    descriptor: None,
+                });
+                Config { inner }
+            })))
         }
     }
 }
@@ -331,19 +301,18 @@ impl Config {
         };
         let hdc = unsafe { gdi::GetDC(hwnd) };
 
-        let descriptor = self
-            .inner
-            .descriptor
-            .as_ref()
-            .map(|desc| desc as _)
-            .unwrap_or(std::ptr::null());
+        let descriptor =
+            self.inner.descriptor.as_ref().map(|desc| desc as _).unwrap_or(std::ptr::null());
 
         unsafe {
-            if gl::SetPixelFormat(hdc, self.inner.pixel_format_index, descriptor) == 0 {
+            let result = if gl::SetPixelFormat(hdc, self.inner.pixel_format_index, descriptor) == 0
+            {
                 Err(IoError::last_os_error().into())
             } else {
                 Ok(())
-            }
+            };
+            gdi::ReleaseDC(hwnd, hdc);
+            result
         }
     }
 
@@ -377,11 +346,7 @@ impl Config {
 impl GlConfig for Config {
     fn color_buffer_type(&self) -> Option<ColorBufferType> {
         let (r_size, g_size, b_size) = match self.inner.descriptor.as_ref() {
-            Some(descriptor) => (
-                descriptor.cRedBits,
-                descriptor.cGreenBits,
-                descriptor.cBlueBits,
-            ),
+            Some(descriptor) => (descriptor.cRedBits, descriptor.cGreenBits, descriptor.cBlueBits),
             _ => unsafe {
                 let r_size = self.raw_attribute(wgl_extra::RED_BITS_ARB as c_int) as u8;
                 let g_size = self.raw_attribute(wgl_extra::GREEN_BITS_ARB as c_int) as u8;
@@ -390,20 +355,12 @@ impl GlConfig for Config {
             },
         };
 
-        Some(ColorBufferType::Rgb {
-            r_size,
-            g_size,
-            b_size,
-        })
+        Some(ColorBufferType::Rgb { r_size, g_size, b_size })
     }
 
     fn float_pixels(&self) -> bool {
         unsafe {
-            self.inner
-                .display
-                .inner
-                .features
-                .contains(DisplayFeatures::FLOAT_PIXEL_FORMAT)
+            self.inner.display.inner.features.contains(DisplayFeatures::FLOAT_PIXEL_FORMAT)
                 && self.raw_attribute(wgl_extra::PIXEL_TYPE_ARB as c_int)
                     == wgl_extra::TYPE_RGBA_FLOAT_ARB as c_int
         }
@@ -417,27 +374,11 @@ impl GlConfig for Config {
     }
 
     fn srgb_capable(&self) -> bool {
-        if self
-            .inner
-            .display
-            .inner
-            .client_extensions
-            .contains(SRGB_EXT)
-            || self
-                .inner
-                .display
-                .inner
-                .client_extensions
-                .contains("WGL_EXT_colorspace")
+        if self.inner.display.inner.client_extensions.contains(SRGB_EXT)
+            || self.inner.display.inner.client_extensions.contains("WGL_EXT_colorspace")
         {
             unsafe { self.raw_attribute(wgl_extra::FRAMEBUFFER_SRGB_CAPABLE_EXT as c_int) != 0 }
-        } else if self
-            .inner
-            .display
-            .inner
-            .client_extensions
-            .contains(SRGB_ARB)
-        {
+        } else if self.inner.display.inner.client_extensions.contains(SRGB_ARB) {
             unsafe { self.raw_attribute(wgl_extra::FRAMEBUFFER_SRGB_CAPABLE_ARB as c_int) != 0 }
         } else {
             false
@@ -459,12 +400,7 @@ impl GlConfig for Config {
     }
 
     fn num_samples(&self) -> u8 {
-        if self
-            .inner
-            .display
-            .inner
-            .features
-            .contains(DisplayFeatures::MULTISAMPLING_PIXEL_FORMATS)
+        if self.inner.display.inner.features.contains(DisplayFeatures::MULTISAMPLING_PIXEL_FORMATS)
         {
             unsafe { self.raw_attribute(wgl_extra::SAMPLES_ARB as c_int) as _ }
         } else {
@@ -484,7 +420,7 @@ impl GlConfig for Config {
                 if dw_flags & gl::PFD_DRAW_TO_BITMAP != 0 {
                     flags |= ConfigSurfaceTypes::PIXMAP;
                 }
-            }
+            },
             _ => unsafe {
                 if self.raw_attribute(wgl_extra::DRAW_TO_WINDOW_ARB as c_int) != 0 {
                     flags |= ConfigSurfaceTypes::WINDOW
@@ -513,19 +449,19 @@ impl GlConfig for Config {
         if self.inner.descriptor.as_ref().is_some() {
             None
         } else {
-            unsafe { Some(self.raw_attribute(wgl_extra::TRANSPARENT_ARB as c_int) != 0) }
+            // WGL_TRANSPARENT_ARB is not reliable and can sometimes produce false
+            // negatives. return None to provide consistent semantics, since we
+            // don't have any better way to detect
+            match unsafe { self.raw_attribute(wgl_extra::TRANSPARENT_ARB as c_int) } {
+                1 => Some(true),
+                _ => None,
+            }
         }
     }
 
     fn api(&self) -> Api {
         let mut api = Api::OPENGL;
-        if self
-            .inner
-            .display
-            .inner
-            .features
-            .contains(DisplayFeatures::CREATE_ES_CONTEXT)
-        {
+        if self.inner.display.inner.features.contains(DisplayFeatures::CREATE_ES_CONTEXT) {
             api |= Api::GLES1 | Api::GLES2;
         }
 
