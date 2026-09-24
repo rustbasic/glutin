@@ -4,6 +4,7 @@ use std::io::Error as IoError;
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
 use std::os::raw::c_int;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fmt, mem};
 
 use glutin_wgl_sys::wgl::types::GLenum;
@@ -29,6 +30,9 @@ use super::config::Config;
 use super::context::PossiblyCurrentContext;
 use super::display::Display;
 
+// Keep successful present diagnostics sparse while retaining every WGL failure.
+static WGL_SWAP_BUFFER_COUNT: AtomicU64 = AtomicU64::new(0);
+
 impl Display {
     pub(crate) unsafe fn create_pixmap_surface(
         &self,
@@ -49,7 +53,8 @@ impl Display {
             .filter(|_| self.inner.client_extensions.contains("WGL_ARB_pbuffer"))
             .ok_or(ErrorKind::NotSupported("pbuffer extensions are not supported"))?;
 
-        let hdc = config.inner.hdc;
+        let hwnd = config.inner.hwnd;
+        let hdc = unsafe { gdi::GetDC(hwnd) };
         let width = surface_attributes.width.unwrap().get() as c_int;
         let height = surface_attributes.height.unwrap().get() as c_int;
         let mut attrs = [0; 3];
@@ -67,6 +72,7 @@ impl Display {
                 attrs.as_ptr(),
             )
         };
+        unsafe { gdi::ReleaseDC(hwnd, hdc) };
         if hbuf.is_null() {
             return Err(IoError::last_os_error().into());
         }
@@ -206,10 +212,31 @@ impl<T: SurfaceTypeTrait> GlSurface<T> for Surface<T> {
     }
 
     fn swap_buffers(&self, _context: &Self::Context) -> Result<()> {
+        let hdc = self.raw.hdc();
+        let sample = WGL_SWAP_BUFFER_COUNT.fetch_add(1, Ordering::Relaxed) % 1_200 == 0;
         unsafe {
-            if gl::SwapBuffers(self.raw.hdc()) == 0 {
-                Err(IoError::last_os_error().into())
+            if gl::SwapBuffers(hdc) == 0 {
+                // Preserve the failure before diagnostic calls can overwrite the OS error.
+                let error = IoError::last_os_error();
+                log::info!(
+                    "SwapBuffers failed: os_error={error:?} os_error_code={:?} hdc={:#X} pixel_format={} current_context={:#X} current_hdc={:#X}",
+                    error.raw_os_error(),
+                    hdc as usize,
+                    gl::GetPixelFormat(hdc),
+                    gl::wglGetCurrentContext() as usize,
+                    gl::wglGetCurrentDC() as usize,
+                );
+                Err(error.into())
             } else {
+                if sample {
+                    log::info!(
+                        "SwapBuffers sample: hdc={:#X} pixel_format={} current_context={:#X} current_hdc={:#X}",
+                        hdc as usize,
+                        gl::GetPixelFormat(hdc),
+                        gl::wglGetCurrentContext() as usize,
+                        gl::wglGetCurrentDC() as usize,
+                    );
+                }
                 Ok(())
             }
         }
