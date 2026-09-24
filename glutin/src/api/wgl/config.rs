@@ -8,6 +8,7 @@ use std::{fmt, iter};
 
 use glutin_wgl_sys::wgl_extra;
 use raw_window_handle::RawWindowHandle;
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Graphics::Gdi::{self as gdi, HDC};
 use windows_sys::Win32::Graphics::OpenGL::{self as gl, PIXELFORMATDESCRIPTOR};
 
@@ -37,19 +38,21 @@ impl Display {
             _ => 0,
         };
         let hdc = unsafe { gdi::GetDC(hwnd) };
+        let _hdc_owner = ConfigHdc { hwnd, hdc };
 
         match self.inner.wgl_extra {
             // Check that particular function was loaded.
             Some(wgl_extra) if wgl_extra.ChoosePixelFormatARB.is_loaded() => {
-                self.find_configs_arb(template, hdc)
+                self.find_configs_arb(template, hwnd, hdc)
             },
-            _ => self.find_normal_configs(template, hdc),
+            _ => self.find_normal_configs(template, hwnd, hdc),
         }
     }
 
     fn find_normal_configs(
         &self,
         template: ConfigTemplate,
+        hwnd: HWND,
         hdc: HDC,
     ) -> Result<Box<dyn Iterator<Item = Config> + '_>> {
         let (r_size, g_size, b_size) = match template.color_buffer_type {
@@ -143,7 +146,7 @@ impl Display {
 
             let inner = Arc::new(ConfigInner {
                 display: self.clone(),
-                hdc,
+                hwnd,
                 pixel_format_index,
                 descriptor: Some(descriptor),
             });
@@ -156,6 +159,7 @@ impl Display {
     fn find_configs_arb(
         &self,
         template: ConfigTemplate,
+        hwnd: HWND,
         hdc: HDC,
     ) -> Result<Box<dyn Iterator<Item = Config> + '_>> {
         let wgl_extra = self.inner.wgl_extra.unwrap();
@@ -272,7 +276,7 @@ impl Display {
             Ok(Box::new(configs.into_iter().map(move |pixel_format_index| {
                 let inner = Arc::new(ConfigInner {
                     display: self.clone(),
-                    hdc,
+                    hwnd,
                     pixel_format_index,
                     descriptor: None,
                 });
@@ -295,20 +299,24 @@ impl Config {
     ///
     /// The `raw_window_handle` should point to a valid value.
     pub unsafe fn apply_on_native_window(&self, raw_window_handle: &RawWindowHandle) -> Result<()> {
-        let hdc = match raw_window_handle {
-            RawWindowHandle::Win32(window) => unsafe { gdi::GetDC(window.hwnd.get() as _) },
+        let hwnd = match raw_window_handle {
+            RawWindowHandle::Win32(window) => window.hwnd.get() as _,
             _ => return Err(ErrorKind::BadNativeWindow.into()),
         };
+        let hdc = unsafe { gdi::GetDC(hwnd) };
 
         let descriptor =
             self.inner.descriptor.as_ref().map(|desc| desc as _).unwrap_or(std::ptr::null());
 
         unsafe {
-            if gl::SetPixelFormat(hdc, self.inner.pixel_format_index, descriptor) == 0 {
+            let result = if gl::SetPixelFormat(hdc, self.inner.pixel_format_index, descriptor) == 0
+            {
                 Err(IoError::last_os_error().into())
             } else {
                 Ok(())
-            }
+            };
+            gdi::ReleaseDC(hwnd, hdc);
+            result
         }
     }
 
@@ -324,16 +332,19 @@ impl Config {
     /// The caller must ensure that the attribute could be present.
     unsafe fn raw_attribute(&self, attr: c_int) -> c_int {
         unsafe {
+            let hwnd = self.inner.hwnd;
+            let hdc = gdi::GetDC(hwnd);
             let wgl_extra = self.inner.display.inner.wgl_extra.unwrap();
             let mut res = 0;
             wgl_extra.GetPixelFormatAttribivARB(
-                self.inner.hdc as *const _,
+                hdc as *const _,
                 self.inner.pixel_format_index,
                 gl::PFD_MAIN_PLANE as _,
                 1,
                 &attr,
                 &mut res,
             );
+            gdi::ReleaseDC(hwnd, hdc);
             res
         }
     }
@@ -481,9 +492,22 @@ impl AsRawConfig for Config {
 
 impl Sealed for Config {}
 
+struct ConfigHdc {
+    hwnd: HWND,
+    hdc: HDC,
+}
+
+impl Drop for ConfigHdc {
+    fn drop(&mut self) {
+        if self.hdc != 0 {
+            unsafe { gdi::ReleaseDC(self.hwnd, self.hdc) };
+        }
+    }
+}
+
 pub(crate) struct ConfigInner {
     pub(crate) display: Display,
-    pub(crate) hdc: HDC,
+    pub(crate) hwnd: HWND,
     pub(crate) pixel_format_index: i32,
     pub(crate) descriptor: Option<PIXELFORMATDESCRIPTOR>,
 }
@@ -499,7 +523,7 @@ impl Eq for ConfigInner {}
 impl fmt::Debug for ConfigInner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
-            .field("hdc", &self.hdc)
+            .field("hwnd", &self.hwnd)
             .field("pixel_format_index", &self.pixel_format_index)
             .finish()
     }
