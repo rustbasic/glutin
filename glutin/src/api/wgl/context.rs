@@ -5,11 +5,13 @@ use std::io::Error as IoError;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::os::raw::c_int;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use glutin_wgl_sys::wgl::types::HGLRC;
 use glutin_wgl_sys::{wgl, wgl_extra};
 use raw_window_handle::RawWindowHandle;
 use windows_sys::Win32::Graphics::Gdi::{self as gdi, HDC};
+use windows_sys::Win32::Graphics::OpenGL as gl;
 
 use crate::config::GetGlConfig;
 use crate::context::{
@@ -25,6 +27,10 @@ use crate::surface::SurfaceTypeTrait;
 use super::config::Config;
 use super::display::Display;
 use super::surface::Surface;
+// Process-local WGL context lifecycle diagnostics. A ContextInner moves between
+// current and non-current wrappers, so one id represents one WGL context lifetime.
+static NEXT_WGL_CONTEXT_INSTANCE_ID: AtomicUsize = AtomicUsize::new(1);
+static LIVE_WGL_CONTEXT_OWNERS: AtomicUsize = AtomicUsize::new(0);
 
 impl Display {
     pub(crate) unsafe fn create_context(
@@ -32,12 +38,18 @@ impl Display {
         config: &Config,
         context_attributes: &ContextAttributes,
     ) -> Result<NotCurrentContext> {
-        let hdc = match context_attributes.raw_window_handle.as_ref() {
-            handle @ Some(RawWindowHandle::Win32(window)) => unsafe {
-                let _ = config.apply_on_native_window(handle.unwrap());
-                gdi::GetDC(window.hwnd.get() as _)
+        let (hwnd, hdc, window_bound_hdc) = match context_attributes.raw_window_handle.as_ref() {
+            handle @ Some(RawWindowHandle::Win32(window)) => {
+                let hwnd = window.hwnd.get() as _;
+                unsafe {
+                    let _ = config.apply_on_native_window(handle.unwrap());
+                    (hwnd, gdi::GetDC(hwnd), true)
+                }
             },
-            _ => config.inner.hdc,
+            _ => {
+                let hwnd = config.inner.hwnd;
+                (hwnd, unsafe { gdi::GetDC(hwnd) }, false)
+            },
         };
 
         let share_ctx = match context_attributes.shared_context {
@@ -45,9 +57,15 @@ impl Display {
             _ => std::ptr::null(),
         };
 
-        let (context, supports_surfaceless) =
+        let context_result = (|| {
             if self.inner.client_extensions.contains("WGL_ARB_create_context") {
-                self.create_context_arb(hdc, share_ctx, context_attributes)?
+                self.create_context_arb(
+                    config,
+                    hdc,
+                    share_ctx,
+                    context_attributes,
+                    window_bound_hdc,
+                )
             } else {
                 unsafe {
                     let raw = wgl::CreateContext(hdc as *const _);
@@ -60,9 +78,21 @@ impl Display {
                         return Err(IoError::last_os_error().into());
                     }
 
-                    (WglContext(raw), false)
+                    Ok((WglContext(raw), false))
                 }
-            };
+            }
+        })();
+
+        unsafe { gdi::ReleaseDC(hwnd, hdc) };
+        let (context, supports_surfaceless) = context_result?;
+
+        let instance_id = NEXT_WGL_CONTEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
+        let live_count = LIVE_WGL_CONTEXT_OWNERS.fetch_add(1, Ordering::Relaxed) + 1;
+        log::info!(
+            "WGL context created: instance_id={instance_id} raw={:#X} live_owners={live_count} window_bound_hdc={}",
+            *context as usize,
+            window_bound_hdc,
+        );
 
         let config = config.clone();
         let is_gles = matches!(context_attributes.api, Some(ContextApi::Gles(_)));
@@ -70,6 +100,7 @@ impl Display {
             display: self.clone(),
             config,
             raw: context,
+            instance_id,
             is_gles,
             supports_surfaceless,
         };
@@ -78,9 +109,11 @@ impl Display {
 
     fn create_context_arb(
         &self,
+        config: &Config,
         hdc: HDC,
         share_context: HGLRC,
         context_attributes: &ContextAttributes,
+        window_bound_hdc: bool,
     ) -> Result<(WglContext, bool)> {
         let extra = self.inner.wgl_extra.as_ref().unwrap();
         let mut attrs = Vec::<c_int>::with_capacity(16);
@@ -211,7 +244,25 @@ impl Display {
         unsafe {
             let raw = extra.CreateContextAttribsARB(hdc as _, share_context, attrs.as_ptr());
             if raw.is_null() {
-                Err(IoError::last_os_error().into())
+                // Preserve this before diagnostic WGL/Win32 queries can overwrite it.
+                let error = IoError::last_os_error();
+                let error_code = error.raw_os_error();
+                let current_context = wgl::GetCurrentContext();
+                let current_hdc = wgl::GetCurrentDC();
+                let actual_pixel_format = gl::GetPixelFormat(hdc);
+                log::info!(
+                    "wglCreateContextAttribsARB failed: os_error={error:?} os_error_code={error_code:?} os_error_hex={:#010X} hdc={:#X} window_bound_hdc={} requested_pixel_format={} actual_pixel_format={} share_context={:#X} has_share_context={} current_context={:#X} current_hdc={:#X} attributes={attrs:?}",
+                    error_code.unwrap_or_default() as u32,
+                    hdc as usize,
+                    window_bound_hdc,
+                    config.inner.pixel_format_index,
+                    actual_pixel_format,
+                    share_context as usize,
+                    !share_context.is_null(),
+                    current_context as usize,
+                    current_hdc as usize,
+                );
+                Err(error.into())
             } else {
                 Ok((WglContext(raw), supports_surfaceless))
             }
@@ -384,6 +435,7 @@ struct ContextInner {
     display: Display,
     config: Config,
     raw: WglContext,
+    instance_id: usize,
     is_gles: bool,
     supports_surfaceless: bool,
 }
@@ -452,8 +504,27 @@ impl ContextInner {
 
 impl Drop for ContextInner {
     fn drop(&mut self) {
-        unsafe {
-            wgl::DeleteContext(*self.raw);
+        let raw = *self.raw;
+        let was_current = unsafe { wgl::GetCurrentContext() == raw };
+        let deleted = unsafe { wgl::DeleteContext(raw) != 0 };
+        let delete_error = (!deleted).then(IoError::last_os_error);
+        let live_count = LIVE_WGL_CONTEXT_OWNERS.fetch_sub(1, Ordering::Relaxed) - 1;
+
+        if deleted {
+            log::info!(
+                "WGL context dropped: instance_id={} raw={:#X} delete_succeeded=true was_current={} live_owners={live_count}",
+                self.instance_id,
+                raw as usize,
+                was_current,
+            );
+        } else {
+            log::warn!(
+                "WGL context dropped: instance_id={} raw={:#X} delete_succeeded=false was_current={} live_owners={live_count} os_error={:?}",
+                self.instance_id,
+                raw as usize,
+                was_current,
+                delete_error,
+            );
         }
     }
 }
